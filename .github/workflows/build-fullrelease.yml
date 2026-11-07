@@ -1,0 +1,101 @@
+name: Build Full Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Job ID unik dari bot"
+        required: true
+        type: string
+      userId:
+        description: "User ID pengirim (opsional)"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: 'JSON: {"mode":"zip","url":"...","buildType":"release","perfMode":"fast","engine":"flutter","tag":"..."}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Baca payload
+        id: p
+        run: |
+          echo '${{ inputs.payload }}' > payload.json
+          echo "url=$(jq -r '.url // empty' payload.json)" >> "$GITHUB_OUTPUT"
+          echo "build_type=$(jq -r '.buildType // "release"' payload.json)" >> "$GITHUB_OUTPUT"
+          echo "perf_mode=$(jq -r '.perfMode // "fast"' payload.json)" >> "$GITHUB_OUTPUT"
+          echo "engine=$(jq -r '.engine // "flutter"' payload.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download & extract source project
+        run: |
+          mkdir -p project
+          curl -L \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ steps.p.outputs.url }}" -o source.zip
+          unzip -q source.zip -d project
+
+          # Kalau hasil unzip cuma 1 folder tunggal di dalamnya, naikkan isinya
+          # ke project/ supaya pubspec.yaml / settings.gradle ada di root PROJECT_DIR.
+          ENTRY_COUNT="$(find project -mindepth 1 -maxdepth 1 | wc -l)"
+          if [ "$ENTRY_COUNT" -eq 1 ]; then
+            INNER="$(find project -mindepth 1 -maxdepth 1)"
+            if [ -d "$INNER" ]; then
+              shopt -s dotglob nullglob
+              mv "$INNER"/* project/ 2>/dev/null || true
+              shopt -u dotglob nullglob
+              rmdir "$INNER" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        if: steps.p.outputs.engine != 'native'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('project/**/*.gradle*', 'project/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build APK (profil)
+        id: build
+        env:
+          BUILD_TYPE: ${{ steps.p.outputs.build_type }}
+          PERF_MODE: ${{ steps.p.outputs.perf_mode }}
+          ENGINE: ${{ steps.p.outputs.engine }}
+          PROJECT_DIR: project
+        run: |
+          chmod +x scripts/build-profile.sh
+          bash scripts/build-profile.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ steps.build.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 1
