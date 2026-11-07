@@ -1,5 +1,4 @@
-
-name: Flutter Build APK
+name: Flutter Build Full Release APK
 
 on:
   workflow_dispatch:
@@ -11,11 +10,6 @@ on:
       tag:
         description: "Tag unik build"
         required: true
-        type: string
-      build_type:
-        description: "Mode build: debug atau release"
-        required: false
-        default: "release"
         type: string
 
 jobs:
@@ -189,25 +183,9 @@ jobs:
         working-directory: project
         run: flutter pub get
 
-      - name: Build APK
+      - name: Build APK (Full Release)
         working-directory: project
-        env:
-          BUILD_TYPE: ${{ inputs.build_type }}
-        run: |
-          set -euo pipefail
-
-          case "$BUILD_TYPE" in
-            debug)
-              flutter build apk --debug
-              ;;
-            release)
-              flutter build apk --release
-              ;;
-            *)
-              echo "::error::build_type harus debug atau release."
-              exit 1
-              ;;
-          esac
+        run: flutter build apk --release
 
       - name: Upload APK sebagai artifact
         if: always()
