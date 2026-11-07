@@ -1,101 +1,219 @@
-name: Build Full Release APK
+
+name: Flutter Build APK
 
 on:
   workflow_dispatch:
     inputs:
-      jobId:
-        description: "Job ID unik dari bot"
+      zip_url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
         required: true
         type: string
-      userId:
-        description: "User ID pengirim (opsional)"
+      tag:
+        description: "Tag unik build"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build: debug atau release"
         required: false
-        default: "0"
+        default: "release"
         type: string
-      payload:
-        description: 'JSON: {"mode":"zip","url":"...","buildType":"release","perfMode":"fast","engine":"flutter","tag":"..."}'
-        required: true
-        type: string
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Baca payload
-        id: p
+      - name: Validasi input wajib
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          BUILD_TAG: ${{ inputs.tag }}
         run: |
-          echo '${{ inputs.payload }}' > payload.json
-          echo "url=$(jq -r '.url // empty' payload.json)" >> "$GITHUB_OUTPUT"
-          echo "build_type=$(jq -r '.buildType // "release"' payload.json)" >> "$GITHUB_OUTPUT"
-          echo "perf_mode=$(jq -r '.perfMode // "fast"' payload.json)" >> "$GITHUB_OUTPUT"
-          echo "engine=$(jq -r '.engine // "flutter"' payload.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Download & extract source project
-        run: |
-          mkdir -p project
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ steps.p.outputs.url }}" -o source.zip
-          unzip -q source.zip -d project
-
-          # Kalau hasil unzip cuma 1 folder tunggal di dalamnya, naikkan isinya
-          # ke project/ supaya pubspec.yaml / settings.gradle ada di root PROJECT_DIR.
-          ENTRY_COUNT="$(find project -mindepth 1 -maxdepth 1 | wc -l)"
-          if [ "$ENTRY_COUNT" -eq 1 ]; then
-            INNER="$(find project -mindepth 1 -maxdepth 1)"
-            if [ -d "$INNER" ]; then
-              shopt -s dotglob nullglob
-              mv "$INNER"/* project/ 2>/dev/null || true
-              shopt -u dotglob nullglob
-              rmdir "$INNER" 2>/dev/null || true
-            fi
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::Input zip_url kosong."
+            exit 1
           fi
 
-      - name: Set up JDK 17
+          if [ -z "$BUILD_TAG" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Flutter
-        if: steps.p.outputs.engine != 'native'
+      - name: Setup Flutter SDK
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.41.9"
           channel: stable
           cache: true
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('project/**/*.gradle*', 'project/**/gradle-wrapper.properties') }}
-          restore-keys: gradle-${{ runner.os }}-
-
-      - name: Build APK (profil)
-        id: build
+      - name: Download ZIP project
         env:
-          BUILD_TYPE: ${{ steps.p.outputs.build_type }}
-          PERF_MODE: ${{ steps.p.outputs.perf_mode }}
-          ENGINE: ${{ steps.p.outputs.engine }}
-          PROJECT_DIR: project
+          ZIP_URL: ${{ inputs.zip_url }}
         run: |
-          chmod +x scripts/build-profile.sh
-          bash scripts/build-profile.sh
+          set -euo pipefail
+          curl --location --fail --show-error \
+            --retry 3 \
+            --retry-delay 2 \
+            --output project.zip \
+            "$ZIP_URL"
 
-      - name: Upload artifact
+          if [ ! -s project.zip ]; then
+            echo "::error::File ZIP kosong."
+            exit 1
+          fi
+
+          ls -lh project.zip
+
+      - name: Validate ZIP archive
+        run: |
+          python3 - <<'PY'
+          import sys
+          import zipfile
+
+          path = "project.zip"
+
+          if not zipfile.is_zipfile(path):
+              print("::error::File yang diunduh bukan arsip ZIP yang valid.")
+              sys.exit(1)
+
+          try:
+              with zipfile.ZipFile(path) as archive:
+                  entries = archive.infolist()
+                  files = [
+                      item for item in entries
+                      if not item.is_dir()
+                      and not item.filename.endswith("/")
+                  ]
+
+                  # Periksa CRC isi file saja.
+                  # Metadata direktori tidak divalidasi karena beberapa
+                  # pembuat ZIP menghasilkan ukuran/CRC direktori yang salah.
+                  for item in files:
+                      try:
+                          with archive.open(item, "r") as stream:
+                              while stream.read(1024 * 1024):
+                                  pass
+                      except Exception as exc:
+                          print(
+                              f"::error::ZIP rusak pada file "
+                              f"{item.filename}: {exc}"
+                          )
+                          sys.exit(1)
+
+                  print(
+                      f"Validasi selesai: {len(files)} file diperiksa; "
+                      f"{len(entries) - len(files)} entri direktori dilewati."
+                  )
+
+          except (zipfile.BadZipFile, OSError) as exc:
+              print(f"::error::Arsip ZIP tidak bisa dibaca: {exc}")
+              sys.exit(1)
+          PY
+
+      - name: Extract ZIP
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir -p project
+
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          from shutil import copyfileobj
+
+          archive_path = Path("project.zip")
+          destination = Path("project").resolve()
+
+          with zipfile.ZipFile(archive_path) as archive:
+              for info in archive.infolist():
+                  name = info.filename.replace("\\", "/")
+
+                  # Abaikan entri direktori; buat direktori dari path file.
+                  if info.is_dir() or name.endswith("/"):
+                      continue
+
+                  target = (destination / name).resolve()
+
+                  # Cegah ZIP Slip / path traversal.
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(
+                          f"::error::Path tidak aman di ZIP: {name}"
+                      )
+
+                  target.parent.mkdir(parents=True, exist_ok=True)
+
+                  try:
+                      with archive.open(info, "r") as source:
+                          with open(target, "wb") as output:
+                              copyfileobj(source, output)
+                  except Exception as exc:
+                      raise SystemExit(
+                          f"::error::Gagal mengekstrak {name}: {exc}"
+                      )
+
+          print("Ekstraksi ZIP selesai.")
+          PY
+
+          # Tangani ZIP yang membungkus project di satu folder.
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+
+          if [ "${#entries[@]}" -eq 1 ] && \
+             [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp="$(mktemp -d)"
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+
+      - name: Validasi pubspec.yaml
+        run: |
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di root project."
+            echo "Pastikan ZIP berisi project Flutter yang benar."
+            echo "Isi folder project:"
+            ls -la project
+            exit 1
+          fi
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: project
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          set -euo pipefail
+
+          case "$BUILD_TYPE" in
+            debug)
+              flutter build apk --debug
+              ;;
+            release)
+              flutter build apk --release
+              ;;
+            *)
+              echo "::error::build_type harus debug atau release."
+              exit 1
+              ;;
+          esac
+
+      - name: Upload APK sebagai artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.jobId }}
-          path: ${{ steps.build.outputs.apk_path }}
-          if-no-files-found: error
+          name: apk-${{ inputs.tag }}
+          path: project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
           retention-days: 1
