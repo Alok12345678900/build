@@ -13,7 +13,7 @@ on:
         description: 'Build Payload (JSON)'
         required: true
       build_type:
-        description: 'release / debug'
+        description: 'release / debug / full-release (universal APK, semua ABI, tanpa flag tambahan)'
         required: false
         default: 'release'
 
@@ -65,6 +65,35 @@ jobs:
           fi
 
           ls -lh project.zip
+
+          python3 - <<'PY'
+          import sys
+          import zipfile
+
+          path = "project.zip"
+
+          if not zipfile.is_zipfile(path):
+              print("::error::File yang diunduh bukan ZIP valid.")
+              sys.exit(1)
+
+          try:
+              with zipfile.ZipFile(path) as archive:
+                  files = [i for i in archive.infolist()
+                           if not i.is_dir() and not i.filename.endswith("/")]
+                  for item in files:
+                      try:
+                          with archive.open(item, "r") as stream:
+                              while stream.read(1024 * 1024):
+                                  pass
+                      except Exception as exc:
+                          print(f"::error::ZIP rusak pada file {item.filename}: {exc}")
+                          sys.exit(1)
+                  print(f"Validasi selesai: {len(files)} file diperiksa.")
+          except (zipfile.BadZipFile, OSError) as exc:
+              print(f"::error::Arsip ZIP tidak bisa dibaca: {exc}")
+              sys.exit(1)
+          PY
+
           unzip -q project.zip -d project_raw
 
           echo "=== Struktur root project_raw ==="
@@ -175,11 +204,17 @@ jobs:
           flutter pub get
           BT="${{ github.event.inputs.build_type }}"
           [ -z "$BT" ] && BT=release
-          flutter build apk --$BT \
-            --target-platform=android-arm64 \
-            --no-tree-shake-icons \
-            --no-shrink \
-            --no-pub 2>&1 | tee build.log
+
+          if [ "$BT" = "full-release" ]; then
+            echo "🚀 FULL RELEASE: universal APK (semua ABI), tanpa flag tambahan"
+            flutter build apk --release 2>&1 | tee build.log
+          else
+            flutter build apk --$BT \
+              --target-platform=android-arm64 \
+              --no-tree-shake-icons \
+              --no-shrink \
+              --no-pub 2>&1 | tee build.log
+          fi
 
       - name: Build Native APK
         if: steps.detect.outputs.type == 'gradle'
@@ -188,6 +223,14 @@ jobs:
           set -euo pipefail
           BT="${{ github.event.inputs.build_type }}"
           [ -z "$BT" ] && BT=release
+
+          ABI_ARG="-Pandroid.injected.build.abi=arm64-v8a"
+          if [ "$BT" = "full-release" ]; then
+            echo "🚀 FULL RELEASE: semua ABI (tanpa filter arm64)"
+            BT=release
+            ABI_ARG=""
+          fi
+
           if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
 
           if [ -f gradlew ]; then
@@ -208,7 +251,7 @@ jobs:
           echo "Running: $CMD $TASK"
           $CMD "$TASK" \
             --parallel --build-cache \
-            -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log || {
+            $ABI_ARG 2>&1 | tee build.log || {
               echo "::error::Build gagal. Cek log di atas."
               tail -100 build.log
               exit 1
@@ -307,7 +350,7 @@ jobs:
           name: apk-${{ github.event.inputs.jobId }}
           path: ${{ env.APK_PATH }}
           compression-level: 0
-          retention-days: 1
+          retention-days: ${{ github.event.inputs.build_type == 'full-release' && 7 || 1 }}
           if-no-files-found: error
 
       - name: Upload build log
