@@ -13,7 +13,7 @@ on:
         description: 'Build Payload (JSON)'
         required: true
       build_type:
-        description: 'release / debug / full-release (full-release = build penuh semua ABI, tanpa flag optimasi)'
+        description: 'release / debug / full-release (fallback; bot normalnya ngirim buildType+perfMode lewat payload)'
         required: false
         default: 'release'
 
@@ -47,8 +47,25 @@ jobs:
           fi
           echo "ZIP_URL=$ZIP_URL" >> "$GITHUB_ENV"
 
+          # ── Mode build efektif ──────────────────────────────────────────
+          # Bot ngirim buildType + perfMode di dalam payload (bukan input build_type).
+          # perfMode: fast = arm64 | low = arm32+arm64 | full = SEMUA ABI (full release)
+          BT_INPUT="${{ github.event.inputs.build_type }}"
+          BT=$(jq -r '.buildType // empty' payload.json)
+          PERF=$(jq -r '.perfMode // empty' payload.json)
+          [ -z "$BT" ] && BT="$BT_INPUT"
+          [ -z "$BT" ] && BT=release
+          [ -z "$PERF" ] && PERF=fast
+          if [ "$BT" = "full-release" ]; then PERF=full; fi
+          if [ "$PERF" = "full" ]; then BT=full-release; fi
+          case "$BT" in debug|release|full-release) ;; *) BT=release ;; esac
+          case "$PERF" in fast|low|full) ;; *) PERF=fast ;; esac
+          echo "▶ Mode build: BT=$BT PERF=$PERF"
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          echo "PERF=$PERF" >> "$GITHUB_ENV"
+
       - name: Validasi input wajib (full-release)
-        if: github.event.inputs.build_type == 'full-release'
+        if: env.BT == 'full-release'
         env:
           JOB_ID: ${{ github.event.inputs.jobId }}
         run: |
@@ -87,7 +104,7 @@ jobs:
           ls -lh project.zip
 
       - name: Validate ZIP archive (full-release)
-        if: github.event.inputs.build_type == 'full-release'
+        if: env.BT == 'full-release'
         run: |
           python3 - <<'PY'
           import sys
@@ -130,7 +147,7 @@ jobs:
           PY
 
       - name: Extract ZIP (full-release, safe extract)
-        if: github.event.inputs.build_type == 'full-release'
+        if: env.BT == 'full-release'
         run: |
           set -euo pipefail
           rm -rf project_raw
@@ -185,7 +202,7 @@ jobs:
           fi
 
       - name: Extract ZIP
-        if: github.event.inputs.build_type != 'full-release'
+        if: env.BT != 'full-release'
         run: |
           set -euo pipefail
           unzip -q project.zip -d project_raw
@@ -241,7 +258,7 @@ jobs:
           fi
 
       - name: Validasi pubspec.yaml (full-release)
-        if: github.event.inputs.build_type == 'full-release' && steps.detect.outputs.type == 'flutter'
+        if: env.BT == 'full-release' && steps.detect.outputs.type == 'flutter'
         run: |
           if [ ! -f "${{ steps.detect.outputs.dir }}/pubspec.yaml" ]; then
             echo "::error::pubspec.yaml tidak ditemukan."
@@ -309,17 +326,22 @@ jobs:
           set -euo pipefail
           flutter config --no-analytics >/dev/null 2>&1 || true
           flutter pub get
-          BT="${{ github.event.inputs.build_type }}"
-          [ -z "$BT" ] && BT=release
+          # BT & PERF sudah dihitung di step "Parse payload"
 
           if [ "$BT" = "full-release" ]; then
-            echo "🚀 FULL RELEASE: fat APK semua ABI (arm64-v8a, armeabi-v7a, x86_64)"
+            echo "🚀 FULL RELEASE: fat APK semua ABI (armeabi-v7a, arm64-v8a, x86_64)"
             flutter build apk --release \
               --target-platform=android-arm,android-arm64,android-x64 \
-              2>&1 | tee build.log
+              --no-pub 2>&1 | tee build.log
           else
+            if [ "$PERF" = "low" ]; then
+              PLATFORMS="android-arm,android-arm64"   # support HP lama (arm32 + arm64)
+            else
+              PLATFORMS="android-arm64"               # kencang: arm64 aja
+            fi
+            echo "⚡ Build $BT • perf=$PERF • platform=$PLATFORMS"
             flutter build apk --$BT \
-              --target-platform=android-arm64 \
+              --target-platform=$PLATFORMS \
               --no-tree-shake-icons \
               --no-shrink \
               --no-pub 2>&1 | tee build.log
@@ -330,17 +352,15 @@ jobs:
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           set -euo pipefail
-          BT="${{ github.event.inputs.build_type }}"
-          [ -z "$BT" ] && BT=release
-          ABI_ARG="-Pandroid.injected.build.abi=arm64-v8a"
-          if [ "$BT" = "debug" ]; then
-            TASK="assembleDebug"
-          elif [ "$BT" = "full-release" ]; then
-            TASK="assembleRelease"
+          # BT & PERF sudah dihitung di step "Parse payload"
+          if [ "$PERF" = "low" ]; then
+            ABI_ARG="-Pandroid.injected.build.abi=armeabi-v7a,arm64-v8a"
+          elif [ "$PERF" = "full" ]; then
             ABI_ARG=""   # full release: jangan batasi ABI
           else
-            TASK="assembleRelease"
+            ABI_ARG="-Pandroid.injected.build.abi=arm64-v8a"
           fi
+          if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
 
           if [ -f gradlew ]; then
             chmod +x gradlew
@@ -459,7 +479,7 @@ jobs:
           name: apk-${{ github.event.inputs.jobId }}
           path: ${{ env.APK_PATH }}
           compression-level: 0
-          retention-days: ${{ github.event.inputs.build_type == 'full-release' && 7 || 1 }}
+          retention-days: ${{ env.BT == 'full-release' && 7 || 1 }}
           if-no-files-found: error
 
       - name: Upload build log
